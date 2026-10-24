@@ -2,6 +2,294 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
+# Local strict recovery patch. Original recovery fallbacks are bypassed for CLI use.
+# Supports intact Bitcoin Core legacy BDB wallets, derivation method 0, mainnet.
+# No disk carving, SQLite/descriptors, password guessing or wallet modification.
+import sys as _sv_sys
+
+
+def _sv_read_size(data, pos):
+    if pos >= len(data):
+        raise ValueError('Truncated CompactSize')
+    first = data[pos]
+    pos += 1
+    if first < 253:
+        return first, pos
+    width = {253: 2, 254: 4, 255: 8}[first]
+    if pos + width > len(data):
+        raise ValueError('Truncated CompactSize')
+    value = int.from_bytes(data[pos:pos + width], 'little')
+    if value < {253: 253, 254: 65536, 255: 4294967296}[first]:
+        raise ValueError('Noncanonical CompactSize')
+    return value, pos + width
+
+
+def _sv_blob(data, pos=0):
+    size, pos = _sv_read_size(data, pos)
+    if size > len(data) - pos:
+        raise ValueError('Truncated byte vector')
+    return data[pos:pos + size], pos + size
+
+
+def _sv_aes_decrypt(key, iv, ciphertext):
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.backends import default_backend
+    if len(key) != 32 or len(iv) != 16 or not ciphertext or len(ciphertext) % 16:
+        raise ValueError('Invalid AES input')
+    dec = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend()).decryptor()
+    raw = dec.update(ciphertext) + dec.finalize()
+    pad = raw[-1]
+    if not 1 <= pad <= 16 or raw[-pad:] != bytes([pad]) * pad:
+        raise ValueError('Invalid PKCS7 padding')
+    return raw[:-pad]
+
+
+def _sv_pubkey(secret, compressed):
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+    number = int.from_bytes(secret, 'big')
+    order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    if len(secret) != 32 or not 0 < number < order:
+        raise ValueError('Invalid private scalar')
+    key = ec.derive_private_key(number, ec.SECP256K1(), default_backend())
+    form = (serialization.PublicFormat.CompressedPoint if compressed
+            else serialization.PublicFormat.UncompressedPoint)
+    return key.public_key().public_bytes(serialization.Encoding.X962, form)
+
+
+def _sv_matches(secret, public):
+    import hmac
+    if not ((len(public) == 33 and public[0] in (2, 3)) or
+            (len(public) == 65 and public[0] == 4)):
+        return False
+    try:
+        return hmac.compare_digest(_sv_pubkey(secret, len(public) == 33), public)
+    except ValueError:
+        return False
+
+
+def _sv_b58check(payload):
+    import hashlib
+    digest = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    data = payload + digest
+    number = int.from_bytes(data, 'big')
+    alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+    text = ''
+    while number:
+        number, rem = divmod(number, 58)
+        text = alphabet[rem] + text
+    return '1' * (len(data) - len(data.lstrip(b'\x00'))) + text
+
+
+def _sv_der_secret(data):
+    # Read SEC1 ECPrivateKey's version and privateKey OCTET STRING.
+    # Curve parameters are not trusted; the scalar must match the stored pubkey.
+    def tlv(pos, tag):
+        if pos + 2 > len(data) or data[pos] != tag:
+            raise ValueError('Invalid SEC1 DER')
+        pos += 1
+        length = data[pos]
+        pos += 1
+        if length & 128:
+            count = length & 127
+            if not 1 <= count <= 4 or pos + count > len(data):
+                raise ValueError('Invalid DER length')
+            length = int.from_bytes(data[pos:pos + count], 'big')
+            pos += count
+        if pos + length > len(data):
+            raise ValueError('Truncated DER')
+        return data[pos:pos + length], pos, pos + length
+    _, begin, end = tlv(0, 48)
+    if end != len(data):
+        raise ValueError('Trailing DER data')
+    version, _, pos = tlv(begin, 2)
+    if version != b'\x01':
+        raise ValueError('Unsupported SEC1 version')
+    secret, _, pos = tlv(pos, 4)
+    if pos > end or len(secret) != 32:
+        raise ValueError('Invalid SEC1 scalar')
+    return secret
+
+
+def _sv_parse_records(records):
+    import struct
+    masters, encrypted, plain = [], [], []
+    for key, value in records:
+        kind, pos = _sv_blob(key)
+        if kind == b'mkey':
+            if len(key) - pos != 4:
+                raise ValueError('Malformed mkey record')
+            enc, vpos = _sv_blob(value)
+            salt, vpos = _sv_blob(value, vpos)
+            if vpos + 8 > len(value):
+                raise ValueError('Truncated mkey record')
+            method, rounds = struct.unpack_from('<II', value, vpos)
+            _, end = _sv_blob(value, vpos + 8)
+            if end != len(value) or len(enc) != 48 or len(salt) != 8 or rounds < 1:
+                raise ValueError('Unsupported or damaged mkey record')
+            masters.append((enc, salt, method, rounds))
+        elif kind in (b'ckey', b'key', b'wkey'):
+            public, end = _sv_blob(key, pos)
+            if end != len(key) or not ((len(public) == 33 and public[0] in (2, 3)) or
+                                      (len(public) == 65 and public[0] == 4)):
+                raise ValueError('Malformed public key record')
+            payload, end = _sv_blob(value)
+            if kind != b'wkey' and end != len(value):
+                raise ValueError('Trailing key record data')
+            if kind == b'ckey':
+                if len(payload) != 48:
+                    raise ValueError('Unsupported encrypted key length')
+                encrypted.append((public, payload))
+            else:
+                secret = _sv_der_secret(payload)
+                if not _sv_matches(secret, public):
+                    raise ValueError('Unencrypted private/public key mismatch')
+                plain.append((public, secret))
+    return masters, encrypted, plain
+
+
+def _sv_read_wallet(path):
+    import os
+    import shutil
+    import tempfile
+    from bsddb3 import db
+    if not os.path.isfile(path):
+        raise ValueError('Input must be an intact BDB wallet file; raw devices are disabled')
+    with tempfile.TemporaryDirectory(prefix='pywallet_strict_') as work:
+        target = shutil.copyfile(path, os.path.join(work, 'wallet.dat'))
+        handle = db.DB()
+        try:
+            handle.open(target, 'main', db.DB_BTREE, db.DB_RDONLY)
+            cursor = handle.cursor()
+            try:
+                records = []
+                rec = cursor.first()
+                while rec:
+                    records.append(rec)
+                    rec = cursor.next()
+            finally:
+                cursor.close()
+        finally:
+            handle.close()
+        return _sv_parse_records(records)
+
+
+def _sv_verify(masters, encrypted, plain, password, max_iterations=10000000):
+    import hashlib
+    if encrypted and not masters:
+        raise ValueError('Encrypted keys exist, but no master key record was found')
+    unsupported = any(item[2] != 0 for item in masters)
+    if unsupported:
+        raise ValueError('Unsupported KDF method; no fallback will run')
+    verified = dict(plain)
+    matched_encrypted = set()
+    for enc, salt, method, rounds in masters:
+        if rounds > max_iterations:
+            raise ValueError('KDF iteration limit exceeded; inspect wallet before increasing limit')
+        derived = password + salt
+        for _ in range(rounds):
+            derived = hashlib.sha512(derived).digest()
+        try:
+            master = _sv_aes_decrypt(derived[:32], derived[32:48], enc)
+        except ValueError:
+            continue
+        if len(master) != 32:
+            continue
+        for public, ciphertext in encrypted:
+            iv = hashlib.sha256(hashlib.sha256(public).digest()).digest()[:16]
+            try:
+                secret = _sv_aes_decrypt(master, iv, ciphertext)
+            except ValueError:
+                continue
+            if _sv_matches(secret, public):
+                verified[public] = secret
+                matched_encrypted.add(public)
+    expected = set(public for public, _ in encrypted)
+    if expected and matched_encrypted != expected:
+        raise ValueError('Password not verified for all encrypted keys, or wallet is damaged; nothing exported')
+    if not verified:
+        raise ValueError('No verifiable private keys; password cannot be confirmed')
+    return verified, len(matched_encrypted)
+
+
+def _sv_main(argv):
+    import argparse
+    import getpass
+    import os
+    parser = argparse.ArgumentParser(description=(
+        'Strict BDB wallet recovery: verifies every private key against its stored public key. '
+        'Wrong/unverified passwords produce no output file. Use a static wallet backup.'))
+    for flag in ('--recover', '--extract_advanced', '--targeted_extract', '--strict-check'):
+        parser.add_argument(flag, action='store_true')
+    parser.add_argument('-w', '--wallet', '--recov_device', dest='wallet', required=True)
+    parser.add_argument('--output_keys', '--extract_output', '--targeted_output', dest='output')
+    parser.add_argument('--max-iterations', type=int, default=10000000)
+    args = parser.parse_args(argv)
+    if args.max_iterations < 1:
+        parser.error('--max-iterations must be positive')
+    try:
+        source = os.path.abspath(args.wallet)
+        if args.output:
+            output = os.path.abspath(args.output)
+            if os.path.exists(output) or os.path.lexists(output):
+                raise ValueError('Output already exists; choose a new filename')
+            if os.path.realpath(output) == os.path.realpath(source):
+                raise ValueError('Output must not be the wallet file')
+        masters, encrypted, plain = _sv_read_wallet(source)
+        print('Records: mkey={}, encrypted={}, unencrypted={}'.format(
+            len(masters), len(encrypted), len(plain)))
+        if masters and not encrypted:
+            raise ValueError('Master key without encrypted key records; password cannot be verified')
+        password = getpass.getpass('Wallet password (hidden): ').encode('utf-8') if encrypted else b''
+        verified, matched = _sv_verify(masters, encrypted, plain, password, args.max_iterations)
+        if encrypted:
+            print('PASSWORD VERIFIED: {} encrypted public/private key pairs match.'.format(matched))
+        else:
+            print('Unencrypted wallet: verified key pairs; no password was tested.')
+        if args.output:
+            # Create only after ALL encrypted records have been verified.
+            # Exclusive create prevents overwriting a wallet, existing file or symlink.
+            fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, 'w') as stream:
+                    for public, secret in sorted(verified.items()):
+                        payload = b'\x80' + secret + (b'\x01' if len(public) == 33 else b'')
+                        stream.write(_sv_b58check(payload) + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                os.unlink(output)
+                raise
+            print('Exported {} verified WIF keys to: {}'.format(len(verified), output))
+        else:
+            print('Check only: no private key file created.')
+        return 0
+    except KeyboardInterrupt:
+        print('\nCancelled; no recovery fallback will run.', file=_sv_sys.stderr)
+        return 130
+    except ImportError:
+        print('Missing dependency: activate the pywallet environment with bsddb3 and cryptography.',
+              file=_sv_sys.stderr)
+        return 2
+    except Exception as error:
+        # Never include exceptions from parsers/crypto that might embed key bytes.
+        if isinstance(error, ValueError):
+            print('FAILED: ' + str(error), file=_sv_sys.stderr)
+        else:
+            print('FAILED: wallet read/export error ({}); no fallback will run.'.format(
+                type(error).__name__), file=_sv_sys.stderr)
+        return 2
+
+
+if __name__ == '__main__' and any(
+        item.split('=', 1)[0] in ('--recover', '--extract_advanced', '--targeted_extract', '--strict-check')
+        for item in _sv_sys.argv[1:]):
+    _sv_sys.exit(_sv_main(_sv_sys.argv[1:]))
+
+# All other original modes below are unchanged and are outside the strict repair.
+
+
 pywversion = "2.3-gsc"
 never_update = False
 
@@ -8516,6 +8804,5 @@ if __name__ == '__main__':
 
             db.close()
         exit()
-
 
 
